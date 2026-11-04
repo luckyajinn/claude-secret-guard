@@ -1,9 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
 import { compileAllow, EMPTY_ALLOW } from './allow'
-import { describeRules, entropy, isPlaceholder, isSecretName, MAX_SCAN_CHARS, scan } from './detect'
+import { describeRules, entropy, isPlaceholder, isSecretName, scan } from './detect'
 import type { Finding } from './detect'
-import { body, fake, SALT } from './fixtures'
+import { body, fake, SALT, vendorTokens } from './fixtures'
 import { fingerprint } from './hash'
 
 const run = (text: string, extra: { path?: string; allow?: ReturnType<typeof compileAllow> } = {}) =>
@@ -350,13 +350,95 @@ test('describeRules lists every rule once, generic last', () => {
   expect(ids).toContain('jwt')
 })
 
-test('text past the limit is cut and the result says so', () => {
-  const long = `${'ab cd '.repeat(Math.ceil(MAX_SCAN_CHARS / 6))}\n${fake.githubToken()}`
-  const result = run(long)
+test('text past the scan limit is cut, and the result says so', () => {
+  const long = `${'ab cd '.repeat(1000)}\n${fake.githubToken()}`
+  const cut = scan(long, { salt: SALT, maxChars: 2000, windowChars: 500 })
 
-  expect(result.isTruncated).toBe(true)
-  expect(result.findings).toEqual([])
+  expect(cut.isTruncated).toBe(true)
+  expect(cut.findings).toEqual([])
   expect(run(`short ${fake.githubToken()}`).isTruncated).toBe(false)
+})
+
+test('long text is scanned to its end, so padding in front of a secret hides nothing', () => {
+  const padded = `${'ab cd '.repeat(Math.ceil(4_000_100 / 6))}\n${fake.githubToken()}`
+  const result = run(padded)
+
+  expect(result.isTruncated).toBe(false)
+  expect(result.findings.map(f => f.rule)).toEqual(['github-token'])
+  expect(result.findings[0]?.start).toBe(padded.length - 40)
+})
+
+test('a secret on the seam between two windows is found once, whole', () => {
+  const token = fake.githubToken()
+
+  for (const at of [980, 999, 1000, 1001, 1990]) {
+    const result = scan(`${' '.repeat(at)}${token} tail`, { salt: SALT, windowChars: 1000 })
+
+    expect(result.findings.map(f => [f.rule, f.start, f.length]), String(at)).toEqual([['github-token', at, 40]])
+  }
+
+  // A name before the seam and its value after it: the window after the seam reads back far enough to see the name.
+  const assigned = scan(`${' '.repeat(990)}db_password = "${fake.password()}"`, { salt: SALT, windowChars: 1000 })
+
+  expect(assigned.findings.map(f => f.rule)).toEqual(['generic-secret'])
+})
+
+test('a type annotation between the name and the value does not hide it', () => {
+  const value = fake.password()
+
+  expect(rules(`password: str = "${value}"`)).toEqual(['generic-secret'])
+  expect(rules(`val apiKey: String = "${value}"`)).toEqual(['generic-secret'])
+  expect(rules(`const dbPassword: string = '${value}'`)).toEqual(['generic-secret'])
+  expect(rules(`secret: Optional[str] = "${value}"`)).toEqual(['generic-secret'])
+  // Not mistaken: a bare name with a plain value, and a comparison.
+  expect(rules(`password: ${value}`)).toEqual(['generic-secret'])
+  expect(rules(`if password == "${value}"`)).toEqual([])
+})
+
+test('a quoted value with escapes, or longer than 200 characters, is still read', () => {
+  const long = Array.from({ length: 7 }, () => fake.secretValue()).join('')
+
+  expect(long.length).toBeGreaterThan(200)
+  expect(rules(`api_token = "${long}"`)).toEqual(['generic-secret'])
+  expect(rules(`password = "ab\\"cd${fake.password()}"`)).toEqual(['generic-secret'])
+  expect(rules(`--password "${long}"`)).toEqual(['generic-secret'])
+})
+
+test('a password that holds a parenthesis is not taken for a function call', () => {
+  expect(rules(`password = "Xk9(${fake.password()}"`)).toEqual(['generic-secret'])
+  expect(rules(`password = "${fake.password()}(x)9!"`)).toEqual(['generic-secret'])
+  expect(rules('password = os.getenv("DB_PASS_NAME")')).toEqual([])
+  expect(rules('api_key = load_key("prod")')).toEqual([])
+  expect(rules('secret = sha256(input_value_here)')).toEqual([])
+})
+
+test('credential names that run together or are short are recognised, and look-alikes are not', () => {
+  for (const name of ['secretkey', 'accesskey', 'privatekey', 'DB_PASS', 'pw', 'APP_KEY', 'license_key', 'JWT_KEY', 'hmac_key']) {
+    expect(isSecretName(name), name).toBe(true)
+  }
+
+  for (const name of ['bypass', 'compass', 'sort_key', 'primary_key', 'monkey', 'passport']) {
+    expect(isSecretName(name), name).toBe(false)
+  }
+})
+
+test('vendor tokens with a fixed prefix are found by their own rule', () => {
+  for (const { rule, value } of vendorTokens()) {
+    expect(rules(`use ${value} here`), rule).toEqual([rule])
+    expect(rules(`"${value}"`), rule).toEqual([rule])
+  }
+
+  // The prefix alone, or on a plain word, is not a token.
+  expect(rules('see glpat-docs, sntrys_ and hvs.vault for details')).toEqual([])
+  expect(rules('the key-value store and the gsk_ prefix')).toEqual([])
+})
+
+test('vendor rules are listed with the others', () => {
+  const ids = describeRules().map(rule => rule.id)
+
+  for (const { rule } of vendorTokens()) {
+    expect(ids, rule).toContain(rule)
+  }
 })
 
 test('pathological input does not hang the scan', () => {

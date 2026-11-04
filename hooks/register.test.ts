@@ -462,3 +462,24 @@ test('with prompt guarding off an attached file is not scanned', { options: { gu
 
   expect((await attach($, 'file', text)).text).toBe(text)
 })
+
+// ---------------------------------------------------------------------------
+// A scan that could not cover everything is not let through unchecked.
+
+const manySteps = Array.from({ length: 21 }, () => 'git commit -m x').join(' && ')
+
+test('a command with more git steps than are scanned is refused in block mode, not waved through', async ($, on) => {
+  engine(on)
+
+  const why = refusal(await $.tool.call({ tool: 'Bash', command: manySteps }))
+
+  expect(why).toContain('secret-guard blocked this git command: it is too big to scan in full')
+  expect(why).toContain('21 git add/commit steps')
+})
+
+test('in warn mode that same command goes through, loudly', { options: { mode: 'warn' } }, async ($, on) => {
+  const { logs } = engine(on)
+
+  expect(ran(await $.tool.call({ tool: 'Bash', command: manySteps }))).toBe(true)
+  expect(logs.join('\n')).toContain('was not fully scanned')
+})

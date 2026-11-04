@@ -13,8 +13,18 @@ import { isPathAllowed, isTextAllowed, EMPTY_ALLOW } from './allow'
 import type { Allow } from './allow'
 import { fingerprint } from './hash'
 
-/** Text past this many characters is not scanned (the result says so). */
-export const MAX_SCAN_CHARS = 4_000_000
+/**
+ * Text past this many characters is not scanned (the result says so, and a guard
+ * in block mode then refuses it rather than let it through unchecked).
+ */
+export const MAX_SCAN_CHARS = 40_000_000
+
+// Long text is scanned in windows, each with some text on either side so that a
+// secret on a seam is seen whole: a window reports only what starts inside it.
+const WINDOW_CHARS = 4_000_000
+const LEFT_CONTEXT = 512
+// Wide enough for the longest thing a rule reads past its start (a private key's body).
+const RIGHT_OVERLAP = 32_768
 
 export type Finding = {
   /** The rule's id, `github-token`. */
@@ -39,11 +49,14 @@ export type ScanOptions = {
   allow?: Allow
   /** The file the text is going into, matched against `path:` allowlist entries. */
   path?: string
+  /** Where scanning stops (default MAX_SCAN_CHARS) and how big a window is (default 4,000,000); the tests turn these down. */
+  maxChars?: number
+  windowChars?: number
 }
 
 export type ScanResult = {
   findings: Finding[]
-  /** True when the text was longer than MAX_SCAN_CHARS and only its start was scanned. */
+  /** True when the text was longer than the scan limit and only its start was scanned. */
   isTruncated: boolean
 }
 
@@ -147,7 +160,12 @@ const isReference = (value: string): boolean =>
   /^\$(?:[A-Za-z_{(]|\d)/.test(value) ||
   /^%[^%\s]+%$/.test(value) ||
   /\$\{|\$\(|\{\{|`/.test(value) ||
-  /[()]/.test(value) ||
+  // A call is a reference: a name of letters (no digits) then `(` (the value is cut at
+  // a quote or `)`, so `load_key("x")` arrives as `load_key(`), or a complete call.
+  // A password that merely holds a parenthesis, `Xk9(2fLq!zz`, is not one.
+  /^[A-Za-z_$][A-Za-z_$.]*\(/.test(value) ||
+  /^[A-Za-z_$][\w$.]*\(.*\)$/.test(value) ||
+  /^[A-Za-z_$][\w$.]*\([A-Za-z_$][\w$.,]*$/.test(value) ||
   /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(value) ||
   /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\[/.test(value) ||
   /^(?:op|vault|ssm|secretsmanager|ref\+\w+|env|file|k8s|aws-sm|gcp-sm):/i.test(value) ||
@@ -235,8 +253,27 @@ const findPrivateKeys = (text: string): Span[] => {
 // Names that mean "a credential": the last word of the name decides, so
 // `GITHUB_TOKEN`, `clientSecret` and `PGPASSWORD` match while `max_tokens`,
 // `tokenizer`, `password_file` and `secret_name` do not.
-const STRONG_SUFFIXES = ['password', 'passwd', 'passphrase', 'secret', 'token', 'credential', 'credentials', 'apikey']
-const KEY_PREFIXES = ['api', 'access', 'auth', 'private', 'signing', 'encryption', 'master', 'client', 'secret']
+const STRONG_SUFFIXES = [
+  'password',
+  'passwd',
+  'passphrase',
+  'secret',
+  'token',
+  'credential',
+  'credentials',
+  'apikey',
+  // Run together (`secretkey=`, `accesskey=`): the name has no word break to split on.
+  'secretkey',
+  'accesskey',
+  'privatekey',
+  'authkey',
+  'signingkey',
+  'encryptionkey',
+  'masterkey',
+]
+// Short names that are a credential only as the whole last word (`DB_PASS`), not as the end of `bypass`.
+const EXACT_STRONG = ['pwd', 'pass', 'pw', 'pswd']
+const KEY_PREFIXES = ['api', 'access', 'auth', 'private', 'signing', 'encryption', 'master', 'client', 'secret', 'app', 'license', 'jwt', 'hmac', 'shared']
 const VALUE_WORDS = ['key', 'value', 'str', 'string', 'b64', 'base64']
 
 const nameWords = (name: string): string[] =>
@@ -247,7 +284,7 @@ const nameWords = (name: string): string[] =>
     .split(/[_.\-\s]+/)
     .filter(word => word !== '')
 
-const isStrongWord = (word: string): boolean => word === 'pwd' || STRONG_SUFFIXES.some(suffix => word.endsWith(suffix))
+const isStrongWord = (word: string): boolean => EXACT_STRONG.includes(word) || STRONG_SUFFIXES.some(suffix => word.endsWith(suffix))
 
 /** True when a variable or key name says its value is a credential. */
 export const isSecretName = (name: string): boolean => {
@@ -278,7 +315,7 @@ export const isSecretName = (name: string): boolean => {
 const isPasswordName = (name: string): boolean => {
   const last = nameWords(name).filter(word => !VALUE_WORDS.includes(word)).pop() ?? ''
 
-  return last === 'pwd' || /pass(?:word|wd|phrase)$/.test(last)
+  return last === 'pwd' || last === 'pass' || last === 'pw' || last === 'pswd' || /pass(?:word|wd|phrase)$/.test(last)
 }
 
 /** The value after `name =` is believable as a hard-coded credential. */
@@ -306,13 +343,18 @@ const isBelievableValue = (value: string, name: string, isQuoted: boolean): bool
 // The name is found and judged first; only a credential's name has its value
 // read, so a value is never swallowed by a name that was not one (the
 // `https:` in `https://host/?token=...` is a name followed by a long run).
-const NAME_THEN_OPERATOR = /(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]{0,63})["']?\s*(?::=|=>|[:=])[ \t]*/g
+// A type annotation may sit between the name and the `=` (a Python or Kotlin
+// declaration with a type); it is only read as one when a value follows the `=`,
+// so a YAML value that ends in base64 padding is still read the plain way.
+const NAME_THEN_OPERATOR =
+  /(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]{0,63})["']?\s*(?::=|=>|:[ \t]*[A-Za-z_][\w.<>[\], |?]{0,40}[ \t]*=(?![=>])[ \t]*(?=\S)|[:=])[ \t]*/g
 const NAME_THEN_FLAG = /(?<![A-Za-z0-9-])--([A-Za-z][A-Za-z0-9-]{0,40})(?:=|[ \t]+)/g
 
 // What follows: a quoted string (its closing quote is a lookahead, so the value
 // ends the match) or a bare run, which stops at `&` (the next query parameter).
-const ASSIGNED_VALUE = /"([^"\\\r\n]{8,200})(?=")|'([^'\\\r\n]{8,200})(?=')|([^\s"'`,;)}\]<>&]{8,200})/y
-const FLAG_VALUE = /"([^"\r\n]{8,200})(?=")|'([^'\r\n]{8,200})(?=')|([^\s"'`<>&]{8,200})/y
+// A quoted value may hold escapes (`\"`, `\\`) and run to 2000 characters.
+const ASSIGNED_VALUE = /"((?:[^"\\\r\n]|\\.){8,2000})(?=")|'((?:[^'\\\r\n]|\\.){8,2000})(?=')|([^\s"'`,;)}\]<>&]{8,200})/y
+const FLAG_VALUE = /"([^"\r\n]{8,2000})(?=")|'([^'\r\n]{8,2000})(?=')|([^\s"'`<>&]{8,200})/y
 
 const credentialValues = (text: string, names: RegExp, values: RegExp): Span[] => {
   const out: Span[] = []
@@ -360,6 +402,50 @@ const hasDigit = (value: string): boolean => /\d/.test(value)
 const STOCK_URL_PASSWORDS = /^(?:pass|password|passwd|secret|postgres|root|admin|user|test|guest|mysql|redis|changeme)$/i
 
 // ---------------------------------------------------------------------------
+// Vendor tokens with a fixed prefix. Each is `prefix + body` with a known
+// length, behind a boundary so a longer word does not match, and a modest
+// entropy floor so a prefix followed by a plain word is left alone.
+
+const vendor = (id: string, label: string, pattern: RegExp, minEntropy = 3): Rule => ({ id, label, find: token(pattern, minEntropy) })
+
+const VENDOR_RULES: readonly Rule[] = [
+  vendor('gitlab-token', 'GitLab token', /(?<![A-Za-z0-9])gl(?:pat|ptt|rt|dt)-[A-Za-z0-9_-]{20,50}(?![A-Za-z0-9_-])/g),
+  vendor('pypi-token', 'PyPI upload token', /(?<![A-Za-z0-9])pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}(?![A-Za-z0-9_-])/g),
+  vendor('shopify-token', 'Shopify token', /(?<![A-Za-z0-9])shp(?:at|ss|ca|pa)_[a-fA-F0-9]{32}(?![A-Za-z0-9])/g),
+  vendor('digitalocean-token', 'DigitalOcean token', /(?<![A-Za-z0-9])do[por]_v1_[a-f0-9]{64}(?![A-Za-z0-9])/g),
+  vendor('databricks-token', 'Databricks token', /(?<![A-Za-z0-9])dapi[a-h0-9]{32}(?![A-Za-z0-9])/g),
+  vendor('sentry-token', 'Sentry auth token', /(?<![A-Za-z0-9])sntrys_[A-Za-z0-9+/=_-]{40,}(?![A-Za-z0-9+/=_-])/g),
+  vendor('supabase-token', 'Supabase access token', /(?<![A-Za-z0-9])sbp_[a-f0-9]{40}(?![A-Za-z0-9])/g),
+  vendor('vault-token', 'HashiCorp Vault token', /(?<![A-Za-z0-9])hv[sbr]\.[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])/g),
+  vendor('terraform-token', 'Terraform Cloud token', /(?<![A-Za-z0-9])[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_-]{60,70}(?![A-Za-z0-9_-])/g),
+  vendor('grafana-token', 'Grafana service account token', /(?<![A-Za-z0-9])glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}(?![A-Za-z0-9])/g),
+  vendor('postman-key', 'Postman API key', /(?<![A-Za-z0-9])PMAK-[a-f0-9]{24}-[a-f0-9]{34}(?![A-Za-z0-9])/g),
+  vendor('atlassian-token', 'Atlassian API token', /(?<![A-Za-z0-9])ATATT3[A-Za-z0-9_=-]{50,}(?![A-Za-z0-9_=-])/g),
+  vendor('google-access-token', 'Google OAuth access token', /(?<![A-Za-z0-9])ya29\.[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g),
+  vendor('age-secret-key', 'age secret key', /(?<![A-Za-z0-9-])AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}(?![A-Za-z0-9])/g),
+  vendor('twilio-key', 'Twilio API key', /(?<![A-Za-z0-9])SK[0-9a-f]{32}(?![A-Za-z0-9])/g),
+  vendor('telegram-bot-token', 'Telegram bot token', /(?<![A-Za-z0-9])[0-9]{8,10}:AA[A-Za-z0-9_-]{33}(?![A-Za-z0-9_-])/g),
+  vendor('discord-bot-token', 'Discord bot token', /(?<![A-Za-z0-9_-])[MNO][A-Za-z0-9_-]{23,25}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}(?![A-Za-z0-9_-])/g, 4),
+  vendor(
+    'discord-webhook',
+    'Discord webhook URL',
+    /https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/[0-9]{17,20}\/[A-Za-z0-9_-]{60,}/g,
+  ),
+  vendor('mailgun-key', 'Mailgun API key', /(?<![A-Za-z0-9])key-[0-9a-f]{32}(?![A-Za-z0-9])/g),
+  vendor('doppler-token', 'Doppler token', /(?<![A-Za-z0-9])dp\.(?:pt|st|sa|ct|scim|audit)\.[A-Za-z0-9]{40,44}(?![A-Za-z0-9])/g),
+  vendor('azure-ad-secret', 'Azure AD client secret', /(?<![A-Za-z0-9_.~-])[A-Za-z0-9_.~-]{3}8Q~[A-Za-z0-9_.~-]{34,}(?![A-Za-z0-9_.~-])/g, 3.3),
+  vendor('notion-token', 'Notion integration token', /(?<![A-Za-z0-9])(?:secret|ntn)_[A-Za-z0-9]{40,50}(?![A-Za-z0-9])/g, 3.3),
+  vendor('linear-key', 'Linear API key', /(?<![A-Za-z0-9])lin_api_[A-Za-z0-9]{40}(?![A-Za-z0-9])/g),
+  vendor('groq-key', 'Groq API key', /(?<![A-Za-z0-9])gsk_[A-Za-z0-9]{52}(?![A-Za-z0-9])/g),
+  vendor('xai-key', 'xAI API key', /(?<![A-Za-z0-9])xai-[A-Za-z0-9]{80}(?![A-Za-z0-9])/g),
+  vendor('perplexity-key', 'Perplexity API key', /(?<![A-Za-z0-9])pplx-[A-Za-z0-9]{48}(?![A-Za-z0-9])/g),
+  vendor('replicate-token', 'Replicate API token', /(?<![A-Za-z0-9])r8_[A-Za-z0-9]{37}(?![A-Za-z0-9])/g),
+  vendor('docker-token', 'Docker personal access token', /(?<![A-Za-z0-9])dckr_pat_[A-Za-z0-9_-]{27}(?![A-Za-z0-9_-])/g),
+  vendor('netlify-token', 'Netlify personal access token', /(?<![A-Za-z0-9])nfp_[A-Za-z0-9]{36}(?![A-Za-z0-9])/g),
+  vendor('square-token', 'Square token', /(?<![A-Za-z0-9])sq0(?:atp|csp)-[A-Za-z0-9_-]{22,43}(?![A-Za-z0-9_-])/g),
+]
+
+// ---------------------------------------------------------------------------
 // The rules, most specific first: where two overlap, the earlier one wins.
 
 const RULES: readonly Rule[] = [
@@ -397,7 +483,7 @@ const RULES: readonly Rule[] = [
   {
     id: 'slack-token',
     label: 'Slack token',
-    find: token(/(?<![A-Za-z0-9])(?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,200}(?![A-Za-z0-9-])/g),
+    find: token(/(?<![A-Za-z0-9])(?:xox[a-z]|xapp)-[A-Za-z0-9%+/=_-]{10,200}(?![A-Za-z0-9%+/=_-])/g),
   },
   {
     id: 'slack-webhook',
@@ -429,6 +515,7 @@ const RULES: readonly Rule[] = [
     label: 'Hugging Face token',
     find: token(/(?<![A-Za-z0-9])hf_[A-Za-z0-9]{34,}(?![A-Za-z0-9])/g, 3.5),
   },
+  ...VENDOR_RULES,
   {
     id: 'jwt',
     label: 'JSON Web Token',
@@ -504,30 +591,44 @@ export const scan = (input: string, options: ScanOptions): ScanResult => {
     return { findings: [], isTruncated: false }
   }
 
-  const isTruncated = input.length > MAX_SCAN_CHARS
-  const text = isTruncated ? input.slice(0, MAX_SCAN_CHARS) : input
-  const taken: Span[] = []
+  const maxChars = options.maxChars ?? MAX_SCAN_CHARS
+  const windowChars = options.windowChars ?? WINDOW_CHARS
+  const isTruncated = input.length > maxChars
+  const text = isTruncated ? input.slice(0, maxChars) : input
   const found: { rule: Rule; span: Span; fingerprint: string }[] = []
 
-  for (const rule of RULES) {
-    for (const span of rule.find(text)) {
-      if (taken.some(other => span.start < other.end && other.start < span.end)) {
-        continue
+  for (let from = 0; from === 0 || from < text.length; from += windowChars) {
+    const to = Math.min(from + windowChars, text.length)
+    const base = Math.max(0, from - LEFT_CONTEXT)
+    const chunk = text.slice(base, Math.min(text.length, to + RIGHT_OVERLAP))
+    const taken: Span[] = []
+
+    for (const rule of RULES) {
+      for (const local of rule.find(chunk)) {
+        const span = { start: local.start + base, end: local.end + base }
+
+        if (taken.some(other => span.start < other.end && other.start < span.end)) {
+          continue
+        }
+
+        const value = text.slice(span.start, span.end)
+        const print = fingerprint(value, options.salt)
+
+        // A private key's body is long enough to contain a placeholder word by
+        // chance, so it is judged by its own check (real base64 after the header).
+        const isStandIn = rule.id !== 'private-key' && isPlaceholder(value)
+
+        if (isStandIn || allow.fingerprints.has(print) || isTextAllowed(allow, value)) {
+          continue
+        }
+
+        taken.push(span)
+
+        // What starts in the text around the window is another window's to report.
+        if (span.start >= from && span.start < to) {
+          found.push({ rule, span, fingerprint: print })
+        }
       }
-
-      const value = text.slice(span.start, span.end)
-      const print = fingerprint(value, options.salt)
-
-      // A private key's body is long enough to contain a placeholder word by
-      // chance, so it is judged by its own check (real base64 after the header).
-      const isStandIn = rule.id !== 'private-key' && isPlaceholder(value)
-
-      if (isStandIn || allow.fingerprints.has(print) || isTextAllowed(allow, value)) {
-        continue
-      }
-
-      taken.push(span)
-      found.push({ rule, span, fingerprint: print })
     }
   }
 

@@ -10,7 +10,18 @@ import { EMPTY_ALLOW, parseEntry } from './allow'
 import { parseSub, renderAllowlist, renderRecent, renderRules, renderStatus, HELP } from './command'
 import type { Config } from './config'
 import { scan } from './detect'
-import { blockedSummary, checkAttachedFile, checkCommandText, checkGit, checkPromptText, denyMessage, isPersonPrompt, promptMessage, warnMessage } from './guard'
+import {
+  blockedSummary,
+  checkAttachedFile,
+  checkCommandText,
+  checkGit,
+  checkPromptText,
+  denyMessage,
+  incompleteMessage,
+  isPersonPrompt,
+  promptMessage,
+  warnMessage,
+} from './guard'
 import type { Checked, Hit, Runner, ScanContext } from './guard'
 import { addEntry, clearRecent, loadAllow, loadEntries, loadRecent, loadSalt, loadTotals, record, removeEntry } from './store'
 import type { KV } from './store'
@@ -100,6 +111,13 @@ async function decide(
   refusal: (hits: readonly Hit[]) => string,
 ): Promise<string | undefined> {
   if (checked.hits.length === 0) {
+    // Part of it was not scanned, and a secret may be in that part: in block mode it is not let through.
+    if (checked.isIncomplete === true && config.mode !== 'warn') {
+      $.ui.toast(`secret-guard blocked ${subject}: too big to scan in full`)
+
+      return incompleteMessage(subject, checked.notes)
+    }
+
     if (checked.notes.length > 0) {
       shout($, warnMessage(subject, [], checked.notes))
     }

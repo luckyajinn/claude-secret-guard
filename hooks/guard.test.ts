@@ -382,11 +382,58 @@ test('truncated git output is a note, and many new files are capped', async () =
 
   expect((await checkGit('git commit -m x', ctx, truncated.runner)).notes[0]).toContain('larger than 4 MiB')
 
-  const many = Array.from({ length: 130 }, (_, i) => `f${i}.txt`)
+  const many = Array.from({ length: 600 }, (_, i) => `f${i}.txt`)
   const files = Object.fromEntries(many.map(f => [f, 'plain text\n']))
   const capped = fakeRunner({ others: { stdout: `${many.join('\0')}\0` } }, files)
   const out = await checkGit('git add .', ctx, capped.runner)
 
-  expect(capped.reads).toHaveLength(100)
-  expect(out.notes[0]).toContain('130 new files')
+  expect(capped.reads).toHaveLength(500)
+  expect(out.notes[0]).toContain('600 new files')
+  // Part of it was not scanned, so a guard in block mode refuses it.
+  expect(out.isIncomplete).toBe(true)
+})
+
+test('a file that git reports as binary but is text is read again with --text', async () => {
+  const token = fake.githubToken()
+  const calls: string[][] = []
+  const runner: Runner = {
+    git: async args => {
+      calls.push(args)
+
+      const stdout = args.includes('--text')
+        ? diffAdding('conf/app.cfg', 3, `t = "${token}"`)
+        : args[0] === 'diff'
+          ? 'Binary files a/conf/app.cfg and b/conf/app.cfg differ\nBinary files a/logo.png and b/logo.png differ\n'
+          : ''
+
+      return { exitCode: 0, stdout, stderr: '', isTruncated: false }
+    },
+    readFile: async () => '',
+  }
+  const out = await checkGit('git commit -m x', ctx, runner)
+  const again = calls.filter(c => c.includes('--text'))
+
+  expect(out.hits.map(h => h.location)).toEqual(['conf/app.cfg:3'])
+  // The image is not read again.
+  expect(again).toHaveLength(1)
+  expect(again[0]?.slice(-2)).toEqual(['--', ':(top,literal)conf/app.cfg'])
+})
+
+test('a new UTF-16 file is read as text, and a real binary is skipped', async () => {
+  const token = fake.githubToken()
+  const wide = `${`TOKEN = ${token}\n`.split('').join('\0')}\0`
+  const { runner } = fakeRunner({ others: { stdout: 'wide.txt\0blob.bin\0' } }, { 'wide.txt': wide, 'blob.bin': 'ab\0cdefghijklmnopqrstuvwxyz' })
+  const out = await checkGit('git add .', ctx, runner)
+
+  expect(out.hits.map(h => h.rule)).toEqual(['github-token'])
+  expect(out.hits[0]?.location).toContain('wide.txt')
+})
+
+test('git steps past the cap make the scan incomplete', async () => {
+  const { runner } = fakeRunner({})
+  const out = await checkGit(Array.from({ length: 21 }, () => 'git commit -m x').join(' && '), ctx, runner)
+
+  expect(out.isIncomplete).toBe(true)
+  expect(out.notes[0]).toContain('21 git add/commit steps')
+  expect(await checkGit('git commit -m x', ctx, runner)).toEqual({ hits: [], notes: [] })
 })
