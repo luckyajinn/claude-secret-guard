@@ -10,7 +10,7 @@ import { EMPTY_ALLOW, parseEntry } from './allow'
 import { parseSub, renderAllowlist, renderRecent, renderRules, renderStatus, HELP } from './command'
 import type { Config } from './config'
 import { scan } from './detect'
-import { checkCommandText, checkGit, checkPromptText, denyMessage, isPersonPrompt, promptMessage, warnMessage } from './guard'
+import { blockedSummary, checkAttachedFile, checkCommandText, checkGit, checkPromptText, denyMessage, isPersonPrompt, promptMessage, warnMessage } from './guard'
 import type { Checked, Hit, Runner, ScanContext } from './guard'
 import { addEntry, clearRecent, loadAllow, loadEntries, loadRecent, loadSalt, loadTotals, record, removeEntry } from './store'
 import type { KV } from './store'
@@ -115,7 +115,7 @@ async function decide(
   }
 
   await report($, guard, 'blocked', checked.hits)
-  $.ui.toast(`secret-guard blocked ${subject}: ${checked.hits.length} possible ${checked.hits.length === 1 ? 'secret' : 'secrets'}`)
+  $.ui.toast(blockedSummary(subject, checked.hits))
 
   return refusal(checked.hits)
 }
@@ -178,6 +178,22 @@ export async function guardPrompt(
   }
 
   return decide($, config, 'prompt', 'your prompt', checkPromptText(text, await loadContext($)), promptMessage)
+}
+
+/**
+ * (c) A file the person named with `@`, as the engine is about to hand it to the
+ * model. Returns the text the model reads in its place, or undefined to let it
+ * through. The file is not scanned when the person asked for it to be left alone
+ * (`guardPrompts` off); in warn mode it goes through, loudly.
+ */
+export async function guardAttachedFile($: EngineInterface, config: Config, text: string): Promise<string | undefined> {
+  if (!config.guardPrompts) {
+    return undefined
+  }
+
+  return decide($, config, 'prompt', 'this attached file', checkAttachedFile(text, await loadContext($)), hits =>
+    denyMessage('this attached file', 'None of the file was sent to the model.', hits),
+  )
 }
 
 // ---------------------------------------------------------------------------

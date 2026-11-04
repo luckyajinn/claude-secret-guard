@@ -2,7 +2,7 @@ import type { Register } from 'claude-code'
 
 import { checkEdit, checkWrite } from './guard'
 import { readConfig } from './config'
-import { guardCommand, guardFile, guardPrompt, runCommand } from './engine'
+import { guardAttachedFile, guardCommand, guardFile, guardPrompt, runCommand } from './engine'
 
 // What a guard that fails (a bug, a timeout) says. It refuses rather than waves
 // the call through: a guard that quietly stops guarding is worse than one that
@@ -67,4 +67,19 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) =>
     next.called ? next(e) : { drop: 'secret-guard could not check your prompt (an internal error), so it was not sent. Nothing was stored.' },
   )
+
+  // (c) Files the person names with `@`. The engine reads the file, then hands the
+  // model its text as an attachment; this is where that text is judged, and a file
+  // with a secret in it reaches the model as a notice instead.
+  on('prompt.attachment', { type: 'file' }, async ($, e, next) => {
+    const withheld = await guardAttachedFile($, config, e.text)
+
+    return withheld === undefined ? next(e) : { text: withheld }
+  }).catch(($, e, next) => (next.called ? next(e) : { text: FAILED('this attached file') }))
+
+  on('prompt.attachment', { type: 'edited_text_file' }, async ($, e, next) => {
+    const withheld = await guardAttachedFile($, config, e.text)
+
+    return withheld === undefined ? next(e) : { text: withheld }
+  }).catch(($, e, next) => (next.called ? next(e) : { text: FAILED('this attached file') }))
 }

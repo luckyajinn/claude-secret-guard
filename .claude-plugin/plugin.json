@@ -1,6 +1,6 @@
 {
   "name": "secret-guard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Blocks API keys, tokens and passwords from reaching files, commands, commits or prompts, and shows only a masked rule and location when it does.",
   "author": { "name": "CJ" },
   "homepage": "https://github.com/luckyajinn/claude-secret-guard",
@@ -36,7 +36,7 @@
     "guardPrompts": {
       "type": "boolean",
       "title": "Guard your prompts",
-      "description": "Scan the prompts you type before they are sent to the model.",
+      "description": "Scan the prompts you type, and the files you name with @, before they are sent to the model.",
       "default": true
     }
   }
