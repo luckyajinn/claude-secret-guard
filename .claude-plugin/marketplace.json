@@ -1,0 +1,12 @@
+{
+  "name": "claude-secret-guard",
+  "description": "claude-secret-guard: a Claude Code mod by CJ that blocks secrets from files, commands, commits and prompts.",
+  "owner": { "name": "CJ" },
+  "plugins": [
+    {
+      "name": "secret-guard",
+      "source": "./",
+      "description": "Blocks API keys, tokens and passwords from reaching files, commands, commits or prompts."
+    }
+  ]
+}

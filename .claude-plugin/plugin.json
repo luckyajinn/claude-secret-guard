@@ -1,0 +1,43 @@
+{
+  "name": "secret-guard",
+  "version": "0.1.0",
+  "description": "Blocks API keys, tokens and passwords from reaching files, commands, commits or prompts, and shows only a masked rule and location when it does.",
+  "author": { "name": "CJ" },
+  "homepage": "https://github.com/luckyajinn/claude-secret-guard",
+  "repository": "https://github.com/luckyajinn/claude-secret-guard",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Mode",
+      "description": "block refuses the action when a secret is found; warn only shows a loud warning and lets it through (useful for a trial period).",
+      "options": ["block", "warn"],
+      "default": "block"
+    },
+    "guardFiles": {
+      "type": "boolean",
+      "title": "Guard file writes and edits",
+      "description": "Scan what the Write, Edit and NotebookEdit tools are about to put in a file.",
+      "default": true
+    },
+    "guardCommands": {
+      "type": "boolean",
+      "title": "Guard shell commands",
+      "description": "Scan the text of Bash and PowerShell commands before they run.",
+      "default": true
+    },
+    "guardCommits": {
+      "type": "boolean",
+      "title": "Guard git add and git commit",
+      "description": "Before git add or git commit runs, scan the changes it would stage or commit.",
+      "default": true
+    },
+    "guardPrompts": {
+      "type": "boolean",
+      "title": "Guard your prompts",
+      "description": "Scan the prompts you type before they are sent to the model.",
+      "default": true
+    }
+  }
+}
