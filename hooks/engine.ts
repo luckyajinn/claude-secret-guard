@@ -10,7 +10,7 @@ import { EMPTY_ALLOW, parseEntry } from './allow'
 import { parseSub, renderAllowlist, renderRecent, renderRules, renderStatus, HELP } from './command'
 import type { Config } from './config'
 import { scan } from './detect'
-import { checkCommandText, checkGit, checkPromptText, denyMessage, isPersonPrompt, promptMessage, warnMessage } from './guard'
+import { blockedSummary, checkCommandText, checkGit, checkPromptText, denyMessage, isPersonPrompt, promptMessage, warnMessage } from './guard'
 import type { Checked, Hit, Runner, ScanContext } from './guard'
 import { addEntry, clearRecent, loadAllow, loadEntries, loadRecent, loadSalt, loadTotals, record, removeEntry } from './store'
 import type { KV } from './store'
@@ -115,7 +115,7 @@ async function decide(
   }
 
   await report($, guard, 'blocked', checked.hits)
-  $.ui.toast(`secret-guard blocked ${subject}: ${checked.hits.length} possible ${checked.hits.length === 1 ? 'secret' : 'secrets'}`)
+  $.ui.toast(blockedSummary(subject, checked.hits))
 
   return refusal(checked.hits)
 }

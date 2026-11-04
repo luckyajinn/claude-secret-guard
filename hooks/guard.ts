@@ -15,6 +15,8 @@ export type Hit = {
   label: string
   location: string
   fingerprint: string
+  /** The file the finding is in, as far as it is known (absolute for a git scan), without a line. Absent for a command or a prompt. */
+  file?: string
 }
 
 export type Checked = {
@@ -23,11 +25,12 @@ export type Checked = {
   notes: string[]
 }
 
-const toHit = (finding: Finding, location: string): Hit => ({
+const toHit = (finding: Finding, location: string, file?: string): Hit => ({
   rule: finding.rule,
   label: finding.label,
   location,
   fingerprint: finding.fingerprint,
+  ...(file === undefined ? {} : { file }),
 })
 
 const TRUNCATED = 'The text was longer than 4,000,000 characters, so only its start was scanned.'
@@ -40,7 +43,7 @@ export const checkWrite = (path: string, content: string, ctx: ScanContext): Che
   const { findings, isTruncated } = scan(content, { ...ctx, path })
 
   return {
-    hits: findings.map(f => toHit(f, `${path}:${f.line}:${f.column}`)),
+    hits: findings.map(f => toHit(f, `${path}:${f.line}:${f.column}`, path)),
     notes: isTruncated ? [TRUNCATED] : [],
   }
 }
@@ -50,7 +53,7 @@ export const checkEdit = (path: string, newText: string, ctx: ScanContext): Chec
   const { findings, isTruncated } = scan(newText, { ...ctx, path })
 
   return {
-    hits: findings.map(f => toHit(f, `${path} (new text, line ${f.line})`)),
+    hits: findings.map(f => toHit(f, `${path} (new text, line ${f.line})`, path)),
     notes: isTruncated ? [TRUNCATED] : [],
   }
 }
@@ -125,18 +128,25 @@ const DIFF = ['diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv', '--
 const MAX_NEW_FILES = 100
 const MAX_OPS = 5
 
-const diffHits = (diff: string, ctx: ScanContext): Hit[] => {
-  const hits: Hit[] = []
+/**
+ * A finding in a git scan before its place is made absolute. `file` is as git
+ * names it: relative to the repository root for a diff (`rel: 'root'`), relative
+ * to the folder git ran in for a file `git ls-files` lists (`rel: 'cwd'`).
+ */
+type Found = { hit: Hit; file: string; tail: string; rel: 'root' | 'cwd' }
+
+const diffFound = (diff: string, ctx: ScanContext): Found[] => {
+  const found: Found[] = []
 
   for (const file of addedByFile(diff)) {
     const { findings } = scan(file.text, { ...ctx, path: file.file })
 
     for (const f of findings) {
-      hits.push(toHit(f, `${file.file}:${file.lines[f.line - 1] ?? '?'}`))
+      found.push({ hit: toHit(f, ''), file: file.file, tail: String(file.lines[f.line - 1] ?? '?'), rel: 'root' })
     }
   }
 
-  return hits
+  return found
 }
 
 const pathspec = (paths: readonly string[]): string[] => (paths.length > 0 ? ['--', ...paths] : [])
@@ -157,15 +167,51 @@ export const checkGit = async (command: string, ctx: ScanContext, runner: Runner
     notes.push(`The command has ${ops.length} git add/commit steps; only the first ${MAX_OPS} were scanned.`)
   }
 
-  const add = (more: Hit[]) => {
-    for (const hit of more) {
-      const key = `${hit.rule}\u0000${hit.location}`
+  // What the current git step has found so far, before its places are made absolute.
+  let found: Found[] = []
+  let stepDir: string | undefined
+
+  const add = (more: Found[]) => {
+    for (const item of more) {
+      const key = [stepDir ?? '', item.hit.rule, item.hit.fingerprint, item.rel, item.file, item.tail].join('\u0000')
 
       if (!seen.has(key)) {
         seen.add(key)
-        hits.push(hit)
+        found.push(item)
       }
     }
+  }
+
+  // The repository folder, and the folder git ran in, as absolute paths; undefined when git will not say.
+  const bases = async (dir: string | undefined): Promise<{ root: string; cwd: string } | undefined> => {
+    try {
+      const out = await runner.git(['rev-parse', '--show-toplevel', '--show-prefix'], dir)
+
+      if (out.exitCode !== 0) {
+        return undefined
+      }
+
+      const lines = out.stdout.split('\n').map(line => line.trim())
+      const root = lines[0] ?? ''
+      const prefix = lines[1] ?? ''
+      const sub = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
+
+      return root === '' ? undefined : { root, cwd: sub === '' ? root : `${root}/${sub}` }
+    } catch {
+      return undefined
+    }
+  }
+
+  // Names each finding by the file's full path, so a block over a folder says where in it.
+  const place = async (items: Found[], dir: string | undefined): Promise<Hit[]> => {
+    const base = await bases(dir)
+
+    return items.map(item => {
+      const from = base === undefined ? undefined : item.rel === 'root' ? base.root : base.cwd
+      const file = from === undefined ? item.file : `${from}/${item.file}`
+
+      return { ...item.hit, file, location: `${file}:${item.tail}` }
+    })
   }
 
   const diff = async (args: string[], dir: string | undefined): Promise<string> => {
@@ -187,61 +233,73 @@ export const checkGit = async (command: string, ctx: ScanContext, runner: Runner
     return out.stdout
   }
 
+  const scanStep = async (op: GitOp): Promise<void> => {
+    const spec = pathspec(op.paths)
+
+    if (op.kind === 'commit') {
+      add(diffFound(await diff([...DIFF, '--cached'], op.dir), ctx))
+
+      if (op.isCommitAll || op.paths.length > 0) {
+        add(diffFound(await diff([...DIFF, ...spec], op.dir), ctx))
+      }
+
+      return
+    }
+
+    if (!op.isEverything && op.paths.length === 0 && !op.isTrackedOnly) {
+      return
+    }
+
+    add(diffFound(await diff([...DIFF, ...spec], op.dir), ctx))
+
+    if (op.isTrackedOnly) {
+      return
+    }
+
+    const listed = new Set(splitNull(await diff(['ls-files', '--others', '--exclude-standard', '-z', ...spec], op.dir)))
+
+    if (op.isForce) {
+      for (const file of splitNull(await diff(['ls-files', '--others', '--ignored', '--exclude-standard', '-z', ...spec], op.dir))) {
+        listed.add(file)
+      }
+    }
+
+    const files = [...listed]
+
+    if (files.length > MAX_NEW_FILES) {
+      notes.push(`${files.length} new files would be added; only the first ${MAX_NEW_FILES} were scanned.`)
+    }
+
+    for (const file of files.slice(0, MAX_NEW_FILES)) {
+      let text: string
+
+      try {
+        text = await runner.readFile(joinPath(op.dir, file))
+      } catch {
+        // Gone, unreadable or over the read limit: nothing to scan.
+        continue
+      }
+
+      if (text.includes('\u0000')) {
+        continue
+      }
+
+      const { findings } = scan(text, { ...ctx, path: file })
+
+      add(findings.map(f => ({ hit: toHit(f, ''), file, tail: `${f.line} (new file)`, rel: 'cwd' as const })))
+    }
+  }
+
   try {
     for (const op of ops.slice(0, MAX_OPS)) {
-      const spec = pathspec(op.paths)
+      found = []
+      stepDir = op.dir
 
-      if (op.kind === 'commit') {
-        add(diffHits(await diff([...DIFF, '--cached'], op.dir), ctx))
+      await scanStep(op)
 
-        if (op.isCommitAll || op.paths.length > 0) {
-          add(diffHits(await diff([...DIFF, ...spec], op.dir), ctx))
-        }
-
-        continue
-      }
-
-      if (!op.isEverything && op.paths.length === 0 && !op.isTrackedOnly) {
-        continue
-      }
-
-      add(diffHits(await diff([...DIFF, ...spec], op.dir), ctx))
-
-      if (op.isTrackedOnly) {
-        continue
-      }
-
-      const listed = new Set(splitNull(await diff(['ls-files', '--others', '--exclude-standard', '-z', ...spec], op.dir)))
-
-      if (op.isForce) {
-        for (const file of splitNull(await diff(['ls-files', '--others', '--ignored', '--exclude-standard', '-z', ...spec], op.dir))) {
-          listed.add(file)
-        }
-      }
-
-      const files = [...listed]
-
-      if (files.length > MAX_NEW_FILES) {
-        notes.push(`${files.length} new files would be added; only the first ${MAX_NEW_FILES} were scanned.`)
-      }
-
-      for (const file of files.slice(0, MAX_NEW_FILES)) {
-        let text: string
-
-        try {
-          text = await runner.readFile(joinPath(op.dir, file))
-        } catch {
-          // Gone, unreadable or over the read limit: nothing to scan.
-          continue
-        }
-
-        if (text.includes('\u0000')) {
-          continue
-        }
-
-        const { findings } = scan(text, { ...ctx, path: file })
-
-        add(findings.map(f => toHit(f, `${file}:${f.line} (new file)`)))
+      // Only a finding needs its place worked out, so a clean scan costs no extra git call.
+      if (found.length > 0) {
+        hits.push(...(await place(found, op.dir)))
       }
     }
   } catch (error) {
@@ -258,7 +316,95 @@ const MAX_LISTED = 8
 
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
 
+const segments = (path: string): string[] => path.split('\\').join('/').split('/')
+
+/** The folder that every one of these files is under, as far as they agree; '' when they share none. */
+export const commonDir = (files: readonly string[]): string => {
+  const [first, ...rest] = files.map(segments)
+
+  if (first === undefined) {
+    return ''
+  }
+
+  let keep = first.length - 1
+
+  for (const other of rest) {
+    let i = 0
+
+    while (i < keep && i < other.length - 1 && first[i] === other[i]) {
+      i += 1
+    }
+
+    keep = i
+  }
+
+  return first.slice(0, keep).join('/')
+}
+
+const lineOf = (hit: Hit): number | undefined => {
+  const file = hit.file
+
+  if (file === undefined || !hit.location.startsWith(`${file}:`)) {
+    return undefined
+  }
+
+  const line = Number.parseInt(hit.location.slice(file.length + 1), 10)
+
+  return Number.isNaN(line) ? undefined : line
+}
+
+/** Many findings across files: one line per file, with how many, which rules and which lines. */
+const listByFile = (hits: readonly Hit[]): string[] => {
+  const groups = new Map<string, Hit[]>()
+
+  for (const hit of hits) {
+    const key = hit.file ?? hit.location
+
+    groups.set(key, [...(groups.get(key) ?? []), hit])
+  }
+
+  const entries = [...groups]
+  const lines = entries.slice(0, MAX_LISTED).map(([file, group]) => {
+    const rules = [...new Set(group.map(hit => hit.rule))].join(', ')
+    const at = [...new Set(group.map(lineOf).filter((line): line is number => line !== undefined))].slice(0, 6)
+
+    return `  - ${file}: ${plural(group.length, 'finding')} (${rules})${at.length > 0 ? ` at line ${at.join(', ')}${group.length > at.length ? ' ...' : ''}` : ''}`
+  })
+
+  if (entries.length > MAX_LISTED) {
+    lines.push(`  - and ${entries.length - MAX_LISTED} more ${entries.length - MAX_LISTED === 1 ? 'file' : 'files'}`)
+  }
+
+  return lines
+}
+
+/**
+ * The one line a block puts in the toast: what was found and where, and for a
+ * commit or a folder over many files how many files and the folder they are under.
+ */
+export const blockedSummary = (subject: string, hits: readonly Hit[]): string => {
+  const head = `secret-guard blocked ${subject}`
+  const only = hits.length === 1 ? hits[0] : undefined
+
+  if (only !== undefined) {
+    return `${head}: ${only.label} at ${only.location}`
+  }
+
+  const files = [...new Set(hits.flatMap(hit => (hit.file === undefined ? [] : [hit.file])))]
+  const count = plural(hits.length, 'possible secret')
+
+  if (files.length === 0 || hits.some(hit => hit.file === undefined)) {
+    return `${head}: ${count}`
+  }
+
+  return files.length === 1 ? `${head}: ${count} in ${files[0]}` : `${head}: ${count} in ${files.length} files under ${commonDir(files) || 'different folders'}`
+}
+
 const list = (hits: readonly Hit[]): string[] => {
+  if (hits.length > MAX_LISTED && hits.every(hit => hit.file !== undefined)) {
+    return listByFile(hits)
+  }
+
   const lines = hits.slice(0, MAX_LISTED).map(hit => `  - ${hit.label} [${hit.rule}] at ${hit.location} (id ${hit.fingerprint})`)
 
   if (hits.length > MAX_LISTED) {

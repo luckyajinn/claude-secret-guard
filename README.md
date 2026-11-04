@@ -31,7 +31,7 @@ Every guard point has a real veto in the mod API, so each one blocks rather than
 - **Warn mode.** Set the `mode` option to `warn` and every guard warns instead of blocking. Useful for a trial week.
 - **git cannot be scanned.** The git check runs `git` on the host through the mod API's `$.process.run`. If a session cannot run host commands, or git fails, the command still runs and a warning says the changes were not scanned. `/secret-guard status` shows whether git scanning is ready.
 
-**How a git check works.** For `git commit` it scans the staged diff (plus the working-tree diff for `-a`, `-p` or named paths). For `git add` it scans the tracked changes under the paths you named and the new files it would add (and ignored files, for `-f`). It reads `git -C <dir>` and understands `&&`, `;`, pipes and quotes. It does not follow `cd`, variables, aliases or scripts. Git is run with `core.fsmonitor` off and `--no-textconv --no-ext-diff`, so a repository's own config cannot make the scan run a program.
+**How a git check works.** For `git commit` it scans the staged diff (plus the working-tree diff for `-a`, `-p` or named paths). For `git add` it scans the tracked changes under the paths you named and the new files it would add (and ignored files, for `-f`). A block names each file by its full path, so a commit over a folder says where the problem is; over many files it lists one line per file (how many findings, which rules, which lines), and the pop-up gives the count and the folder they share. It reads `git -C <dir>` and understands `&&`, `;`, pipes and quotes. It does not follow `cd`, variables, aliases or scripts. Git is run with `core.fsmonitor` off and `--no-textconv --no-ext-diff`, so a repository's own config cannot make the scan run a program.
 
 **If the guard itself fails** (a bug, a timeout) it refuses the action with a message rather than waving it through. The way out is `claude plugin disable secret-guard`.
 
@@ -127,7 +127,7 @@ The mod makes no network calls and writes no secret anywhere: not in messages, t
 
 - **What the model reads.** `Read`, `Grep`, `cat .env`, MCP results, web pages and command output are not scanned or redacted. If a secret is in your project, this mod does not stop the model from seeing it.
 - **Other tools' arguments.** `Agent` prompts, MCP tool calls, `WebFetch` URLs and the like are not scanned.
-- **Files written by a command.** `echo "$KEY" > file`, a script that generates a config, a `curl -o`: the text of the command is scanned, what it writes is not.
+- **Files written by a command.** `echo "$KEY" > file`, a script that generates a config, a `curl -o`: the text of the command is scanned, what it writes is not. That includes a file a command creates and then `git add`s in the same line (`echo … > f && git add f`): the git scan runs before the command does, so the file is not there to see yet. Run the `git add` or `git commit` as its own command and it is scanned.
 - **`git push`**, commits made outside Claude Code, commits made by a script, a commit in a folder other than the session's after `cd` (use `git -C`, which it follows), and secrets already in history.
 - **Prompts that are not yours.** Task notifications, scheduled runs, messages from a peer session or a channel, and prompts another plugin raised on its own are left alone, because they are not yours to edit. Everything it cannot attribute is scanned.
 - **Other plugins.** Hooks run in a chain. A plugin that sits above this one can change or skip its checks.

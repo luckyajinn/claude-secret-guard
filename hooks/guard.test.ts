@@ -12,6 +12,8 @@ import {
   denyMessage,
   isPersonPrompt,
   promptMessage,
+  blockedSummary,
+  commonDir,
   warnMessage,
 } from './guard'
 import type { Hit, Runner, ScanContext } from './guard'
@@ -30,7 +32,7 @@ test('a write is located as path:line:column and a clean one is clean', () => {
   const hit = checkWrite('/p/src/config.ts', `line one\nconst token = "${token}"\n`, ctx).hits
 
   expect(hit).toEqual([
-    { rule: 'github-token', label: 'GitHub token', location: '/p/src/config.ts:2:16', fingerprint: fingerprint(token, SALT) },
+    { rule: 'github-token', label: 'GitHub token', location: '/p/src/config.ts:2:16', fingerprint: fingerprint(token, SALT), file: '/p/src/config.ts' },
   ])
   expect(checkWrite('/p/src/config.ts', 'const x = 1\n', ctx)).toEqual({ hits: [], notes: [] })
 })
@@ -149,7 +151,16 @@ const fakeRunner = (
     git: async (args, dir) => {
       calls.push({ args, dir })
 
-      const key = args.includes('--cached') ? 'cached' : args[0] === 'ls-files' ? (args.includes('--ignored') ? 'ignored' : 'others') : 'worktree'
+      const key =
+        args[0] === 'rev-parse'
+          ? 'toplevel'
+          : args.includes('--cached')
+            ? 'cached'
+            : args[0] === 'ls-files'
+              ? args.includes('--ignored')
+                ? 'ignored'
+                : 'others'
+              : 'worktree'
       const reply = replies[key] ?? {}
 
       return { exitCode: reply.exitCode ?? 0, stdout: reply.stdout ?? '', stderr: reply.stderr ?? '', isTruncated: reply.isTruncated ?? false }
@@ -177,10 +188,11 @@ test('git commit scans the staged changes and names file and line', async () => 
   const out = await checkGit('git commit -m "add config"', ctx, runner)
 
   expect(out.hits).toEqual([
-    { rule: 'github-token', label: 'GitHub token', location: 'src/app.ts:14', fingerprint: fingerprint(token, SALT) },
+    { rule: 'github-token', label: 'GitHub token', location: 'src/app.ts:14', fingerprint: fingerprint(token, SALT), file: 'src/app.ts' },
   ])
   expect(out.notes).toEqual([])
-  expect(calls).toHaveLength(1)
+  // The diff, then one rev-parse to say which folder the finding is in.
+  expect(calls.map(c => c.args[0])).toEqual(['diff', 'rev-parse'])
   expect(calls[0]?.args).toContain('--cached')
   expect(calls[0]?.args).toContain('--no-textconv')
   expect(calls[0]?.args).toContain('--no-ext-diff')
@@ -192,7 +204,7 @@ test('git commit -a also scans the working-tree changes, and a path limits them'
   const out = await checkGit('git commit -am "wip"', ctx, runner)
 
   expect(out.hits.map(h => h.location)).toEqual(['b.ts:3'])
-  expect(calls.map(c => c.args.includes('--cached'))).toEqual([true, false])
+  expect(calls.filter(c => c.args[0] === 'diff').map(c => c.args.includes('--cached'))).toEqual([true, false])
 
   const scoped = fakeRunner({})
 
@@ -274,6 +286,81 @@ test('a git failure is a note, except not being in a repository', async () => {
   const outside = fakeRunner({ cached: { exitCode: 128, stderr: 'fatal: not a git repository (or any parent)' } })
 
   expect(await checkGit('git commit -m x', ctx, outside.runner)).toEqual({ hits: [], notes: [] })
+})
+
+test('a git finding is named by its full path: the repository folder for a diff, the folder git ran in for a new file', async () => {
+  const token = fake.githubToken()
+  const { runner } = fakeRunner(
+    {
+      toplevel: { stdout: 'C:/work/app\nweb/\n' },
+      worktree: { stdout: diffAdding('web/old.ts', 7, `const t = "${token}"`) },
+      others: { stdout: 'page.html\0' },
+    },
+    { 'page.html': `<script>const k = "${fake.githubToken()}"</script>\n` },
+  )
+  const out = await checkGit('git add .', ctx, runner)
+
+  // The diff names the file from the repository root; ls-files names it from where git ran (web/).
+  expect(out.hits.map(h => h.location)).toEqual(['C:/work/app/web/old.ts:7', 'C:/work/app/web/page.html:1 (new file)'])
+  expect(out.hits.map(h => h.file)).toEqual(['C:/work/app/web/old.ts', 'C:/work/app/web/page.html'])
+})
+
+test('without a repository folder from git a finding keeps the path git gave', async () => {
+  const token = fake.githubToken()
+  const { runner } = fakeRunner({ cached: { stdout: diffAdding('src/app.ts', 3, `t = "${token}"`) }, toplevel: { exitCode: 128 } })
+
+  expect((await checkGit('git commit -m x', ctx, runner)).hits.map(h => h.location)).toEqual(['src/app.ts:3'])
+})
+
+test('the same line in two repositories is two findings', async () => {
+  const token = fake.githubToken()
+  const { runner } = fakeRunner({ cached: { stdout: diffAdding('a.ts', 2, `x = "${token}"`) } })
+  const out = await checkGit('git -C one commit -m x && git -C two commit -m y', ctx, runner)
+
+  expect(out.hits).toHaveLength(2)
+})
+
+test('commonDir finds the folder a set of files share', () => {
+  expect(commonDir(['C:/work/app/web/a.ts', 'C:/work/app/web/b/c.ts'])).toBe('C:/work/app/web')
+  expect(commonDir(['C:\\work\\app\\a.ts', 'C:/work/app/src/b.ts'])).toBe('C:/work/app')
+  expect(commonDir(['/a/x.ts', '/b/y.ts'])).toBe('')
+  expect(commonDir(['/a/b/x.ts'])).toBe('/a/b')
+  expect(commonDir([])).toBe('')
+})
+
+test('the toast says what and where for one finding, and how many files and under which folder for many', () => {
+  const at = (file: string, line: number): Hit => ({ rule: 'jwt', label: 'JSON Web Token', location: `${file}:${line}`, fingerprint: 'abcdef01', file })
+  const one = [at('/r/src/a.ts', 4)]
+  const many = [at('/r/src/a.ts', 4), at('/r/src/a.ts', 9), at('/r/docs/b.md', 2)]
+
+  expect(blockedSummary('this git command', one)).toBe('secret-guard blocked this git command: JSON Web Token at /r/src/a.ts:4')
+  expect(blockedSummary('this git command', many)).toBe('secret-guard blocked this git command: 3 possible secrets in 2 files under /r')
+  expect(blockedSummary('this git command', [at('/r/src/a.ts', 4), at('/r/src/a.ts', 9)])).toBe(
+    'secret-guard blocked this git command: 2 possible secrets in /r/src/a.ts',
+  )
+  // A command or a prompt has no file.
+  const typed: Hit = { rule: 'jwt', label: 'JSON Web Token', location: 'prompt line 2, column 5', fingerprint: 'abcdef01' }
+
+  expect(blockedSummary('your prompt', [typed])).toBe('secret-guard blocked your prompt: JSON Web Token at prompt line 2, column 5')
+  expect(blockedSummary('your prompt', [typed, typed])).toBe('secret-guard blocked your prompt: 2 possible secrets')
+})
+
+test('many findings over files are listed one line per file, with rules and lines', () => {
+  const at = (file: string, line: number, rule: string): Hit => ({ rule, label: rule, location: `${file}:${line}`, fingerprint: 'abcdef01', file })
+  const hits = [
+    ...Array.from({ length: 7 }, (_, i) => at('/r/a.ts', i + 1, 'jwt')),
+    at('/r/b/c.ts', 40, 'github-token'),
+    at('/r/b/c.ts', 41, 'jwt'),
+    ...Array.from({ length: 9 }, (_, i) => at(`/r/many/f${i}.ts`, 1, 'jwt')),
+  ]
+  const lines = denyMessage('this git command', 'Nothing was staged or committed.', hits)
+    .split('\n')
+    .filter(line => line.startsWith('  - '))
+
+  expect(lines[0]).toBe('  - /r/a.ts: 7 findings (jwt) at line 1, 2, 3, 4, 5, 6 ...')
+  expect(lines[1]).toBe('  - /r/b/c.ts: 2 findings (github-token, jwt) at line 40, 41')
+  expect(lines).toHaveLength(9)
+  expect(lines[8]).toBe('  - and 3 more files')
 })
 
 test('a runner that cannot run git degrades to a note and never throws', async () => {
