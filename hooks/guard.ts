@@ -5,7 +5,7 @@
 import type { Allow } from './allow'
 import { scan } from './detect'
 import type { Finding } from './detect'
-import { addedByFile, parseGitOps, splitNull } from './git'
+import { addedByFile, binaryPaths, parseGitOps, splitNull, unwide } from './git'
 import type { GitOp } from './git'
 
 export type ScanContext = { salt: string; allow: Allow }
@@ -23,6 +23,12 @@ export type Checked = {
   hits: Hit[]
   /** Things the person should know that are not findings: text too long to scan, a git scan that could not run. */
   notes: string[]
+  /**
+   * True when part of what was asked about was not scanned (text past the limit, git
+   * steps or files past the caps). A guard in block mode then refuses it rather than
+   * let it through unchecked.
+   */
+  isIncomplete?: boolean
 }
 
 const toHit = (finding: Finding, location: string, file?: string): Hit => ({
@@ -33,7 +39,9 @@ const toHit = (finding: Finding, location: string, file?: string): Hit => ({
   ...(file === undefined ? {} : { file }),
 })
 
-const TRUNCATED = 'The text was longer than 4,000,000 characters, so only its start was scanned.'
+const TRUNCATED = 'The text was longer than 40,000,000 characters, so only its start was scanned.'
+
+const incomplete = (is: boolean): { isIncomplete?: true } => (is ? { isIncomplete: true } : {})
 
 // ---------------------------------------------------------------------------
 // The text guards: file contents, a shell command, a prompt
@@ -45,6 +53,7 @@ export const checkWrite = (path: string, content: string, ctx: ScanContext): Che
   return {
     hits: findings.map(f => toHit(f, `${path}:${f.line}:${f.column}`, path)),
     notes: isTruncated ? [TRUNCATED] : [],
+    ...incomplete(isTruncated),
   }
 }
 
@@ -55,6 +64,7 @@ export const checkEdit = (path: string, newText: string, ctx: ScanContext): Chec
   return {
     hits: findings.map(f => toHit(f, `${path} (new text, line ${f.line})`, path)),
     notes: isTruncated ? [TRUNCATED] : [],
+    ...incomplete(isTruncated),
   }
 }
 
@@ -65,6 +75,7 @@ export const checkCommandText = (command: string, ctx: ScanContext): Checked => 
   return {
     hits: findings.map(f => toHit(f, `command line ${f.line}, column ${f.column}`)),
     notes: isTruncated ? [TRUNCATED] : [],
+    ...incomplete(isTruncated),
   }
 }
 
@@ -75,6 +86,7 @@ export const checkPromptText = (text: string, ctx: ScanContext): Checked => {
   return {
     hits: findings.map(f => toHit(f, `prompt line ${f.line}, column ${f.column}`)),
     notes: isTruncated ? [TRUNCATED] : [],
+    ...incomplete(isTruncated),
   }
 }
 
@@ -89,6 +101,7 @@ export const checkAttachedFile = (text: string, ctx: ScanContext): Checked => {
   return {
     hits: findings.map(f => toHit(f, `attached file, about line ${f.line}`)),
     notes: isTruncated ? [TRUNCATED] : [],
+    ...incomplete(isTruncated),
   }
 }
 
@@ -139,8 +152,11 @@ export type Runner = {
 
 // --no-ext-diff and --no-textconv: a repository's config must not get to run a program during the scan.
 const DIFF = ['diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--diff-filter=ACMRT']
-const MAX_NEW_FILES = 100
-const MAX_OPS = 5
+const MAX_NEW_FILES = 500
+const MAX_OPS = 20
+const MAX_BINARY_RECHECKS = 10
+const KNOWN_BINARY =
+  /\.(?:png|jpe?g|gif|webp|ico|bmp|tiff?|pdf|zip|gz|tgz|bz2|xz|7z|rar|jar|war|woff2?|ttf|otf|eot|mp[34]|mov|avi|mkv|webm|wav|flac|ogg|exe|dll|so|dylib|bin|class|o|a|pyc|wasm|sqlite3?|db|psd)$/i
 
 /**
  * A finding in a git scan before its place is made absolute. `file` is as git
@@ -153,7 +169,14 @@ const diffFound = (diff: string, ctx: ScanContext): Found[] => {
   const found: Found[] = []
 
   for (const file of addedByFile(diff)) {
-    const { findings } = scan(file.text, { ...ctx, path: file.file })
+    // UTF-16 text (PowerShell's `>`) comes through with a NUL after every letter.
+    const text = unwide(file.text)
+
+    if (text === undefined) {
+      continue
+    }
+
+    const { findings } = scan(text, { ...ctx, path: file.file })
 
     for (const f of findings) {
       found.push({ hit: toHit(f, ''), file: file.file, tail: String(file.lines[f.line - 1] ?? '?'), rel: 'root' })
@@ -176,9 +199,11 @@ export const checkGit = async (command: string, ctx: ScanContext, runner: Runner
   const notes: string[] = []
   const seen = new Set<string>()
   const ops: GitOp[] = parseGitOps(command).filter(op => !op.isSkipped)
+  let isIncomplete = false
 
   if (ops.length > MAX_OPS) {
     notes.push(`The command has ${ops.length} git add/commit steps; only the first ${MAX_OPS} were scanned.`)
+    isIncomplete = true
   }
 
   // What the current git step has found so far, before its places are made absolute.
@@ -251,10 +276,10 @@ export const checkGit = async (command: string, ctx: ScanContext, runner: Runner
     const spec = pathspec(op.paths)
 
     if (op.kind === 'commit') {
-      add(diffFound(await diff([...DIFF, '--cached'], op.dir), ctx))
+      add(diffFound(await textDiff([...DIFF, '--cached'], op.dir), ctx))
 
       if (op.isCommitAll || op.paths.length > 0) {
-        add(diffFound(await diff([...DIFF, ...spec], op.dir), ctx))
+        add(diffFound(await textDiff([...DIFF, ...spec], op.dir), ctx))
       }
 
       return
@@ -264,7 +289,7 @@ export const checkGit = async (command: string, ctx: ScanContext, runner: Runner
       return
     }
 
-    add(diffFound(await diff([...DIFF, ...spec], op.dir), ctx))
+    add(diffFound(await textDiff([...DIFF, ...spec], op.dir), ctx))
 
     if (op.isTrackedOnly) {
       return
@@ -281,7 +306,8 @@ export const checkGit = async (command: string, ctx: ScanContext, runner: Runner
     const files = [...listed]
 
     if (files.length > MAX_NEW_FILES) {
-      notes.push(`${files.length} new files would be added; only the first ${MAX_NEW_FILES} were scanned.`)
+      notes.push(`${files.length} new files would be added; only the first ${MAX_NEW_FILES} were scanned. Add fewer files per command.`)
+      isIncomplete = true
     }
 
     for (const file of files.slice(0, MAX_NEW_FILES)) {
@@ -294,14 +320,34 @@ export const checkGit = async (command: string, ctx: ScanContext, runner: Runner
         continue
       }
 
-      if (text.includes('\u0000')) {
+      // UTF-16 text (PowerShell's `>` writes it) has a NUL after every letter; a real binary has few.
+      const readable = unwide(text)
+
+      if (readable === undefined) {
         continue
       }
 
-      const { findings } = scan(text, { ...ctx, path: file })
+      const { findings } = scan(readable, { ...ctx, path: file })
 
       add(findings.map(f => ({ hit: toHit(f, ''), file, tail: `${f.line} (new file)`, rel: 'cwd' as const })))
     }
+  }
+
+  // A diff that says "Binary files differ" for a file that is really text (a
+  // `.gitattributes` with `-diff`, or UTF-16) is read again with `--text`, for
+  // the files that are not an obvious binary type, up to a few per diff.
+  const textDiff = async (args: string[], dir: string | undefined): Promise<string> => {
+    const out = await diff(args, dir)
+    const split = args.indexOf('--')
+    const base = split < 0 ? args : args.slice(0, split)
+    const again: string[] = []
+
+    for (const path of binaryPaths(out).filter(p => !KNOWN_BINARY.test(p)).slice(0, MAX_BINARY_RECHECKS)) {
+      // `:(top,literal)` names the path from the repository root, as the diff printed it.
+      again.push(await diff([...base, '--text', '--', `:(top,literal)${path}`], dir))
+    }
+
+    return again.length === 0 ? out : `${out}\n${again.join('\n')}`
   }
 
   try {
@@ -320,7 +366,7 @@ export const checkGit = async (command: string, ctx: ScanContext, runner: Runner
     notes.push(`The git changes could not be read (${errorName(error)}), so they were not scanned.`)
   }
 
-  return { hits, notes }
+  return { hits, notes, ...incomplete(isIncomplete) }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +509,14 @@ export const promptMessage = (hits: readonly Hit[]): string => {
     `${hits.length === 1 ? 'If it is a harmless placeholder' : 'If they are harmless placeholders'}, run /secret-guard allow fp:${hits[0]?.fingerprint ?? ''} first.`,
   ].join(' ')
 }
+
+/** What a block says when nothing was found but not all of it could be scanned. One line, as the prompt guard's text is. */
+export const incompleteMessage = (subject: string, notes: readonly string[]): string =>
+  [
+    `secret-guard blocked ${subject}: it is too big to scan in full, so it was not let through unchecked.`,
+    ...notes,
+    'Send it in smaller pieces, or switch secret-guard to warn mode (the mode option) if you accept that part going unscanned.',
+  ].join(' ')
 
 /** What warn mode, or a guard that could not scan, shows loudly instead of blocking. */
 export const warnMessage = (subject: string, hits: readonly Hit[], notes: readonly string[]): string =>

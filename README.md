@@ -32,7 +32,7 @@ Every guard point has a real veto in the mod API, so each one blocks rather than
 - **Warn mode.** Set the `mode` option to `warn` and every guard warns instead of blocking. Useful for a trial week.
 - **git cannot be scanned.** The git check runs `git` on the host through the mod API's `$.process.run`. If a session cannot run host commands, or git fails, the command still runs and a warning says the changes were not scanned. `/secret-guard status` shows whether git scanning is ready.
 
-**How a git check works.** For `git commit` it scans the staged diff (plus the working-tree diff for `-a`, `-p` or named paths). For `git add` it scans the tracked changes under the paths you named and the new files it would add (and ignored files, for `-f`). A block names each file by its full path, so a commit over a folder says where the problem is; over many files it lists one line per file (how many findings, which rules, which lines), and the pop-up gives the count and the folder they share. It reads `git -C <dir>` and understands `&&`, `;`, pipes and quotes. It does not follow `cd`, variables, aliases or scripts. Git is run with `core.fsmonitor` off and `--no-textconv --no-ext-diff`, so a repository's own config cannot make the scan run a program.
+**How a git check works.** For `git commit` it scans the staged diff (plus the working-tree diff for `-a`, `-p` or named paths). For `git add` it scans the tracked changes under the paths you named and the new files it would add (and ignored files, for `-f`). A block names each file by its full path, so a commit over a folder says where the problem is; over many files it lists one line per file (how many findings, which rules, which lines), and the pop-up gives the count and the folder they share. It reads `git -C <dir>`, `--git-dir`, `--work-tree` and `GIT_DIR`, follows `cd` (and looks at the folder it left too), and understands `&&`, `;`, pipes, quotes, line continuations, escaped words (`g\it`), `if`/`then`/`!`/`{`, `sudo`/`env`, `bash -c`, `powershell -Command`, `cmd /c`, `eval`, and abbreviated options (`--upd`). A command that is itself a variable (`$G commit`) is read the widest way: every staged and tracked change. It does not follow aliases or scripts. A file git reports as binary but that is text (a `.gitattributes` `-diff`, or UTF-16 as PowerShell's `>` writes) is read as text. Git is run with `core.fsmonitor` off and `--no-textconv --no-ext-diff`, so a repository's own config cannot make the scan run a program.
 
 **If the guard itself fails** (a bug, a timeout) it refuses the action with a message rather than waving it through. The way out is `claude plugin disable secret-guard`.
 
@@ -63,6 +63,7 @@ The `id` is the first 8 hex digits of a SHA-256 of the value with a per-install 
 | `slack-token`, `slack-webhook` | `xoxb-`, `xoxp-`, `xapp-` and similar tokens; `hooks.slack.com/services/…` URLs. |
 | `google-api-key`, `google-oauth-secret` | `AIza…` keys; `GOCSPX-` client secrets. |
 | `sendgrid-key`, `npm-token`, `huggingface-token` | `SG.…`, `npm_…`, `hf_…`. |
+| Other vendor tokens | GitLab (`glpat-`), PyPI (`pypi-AgEI…`), Shopify (`shpat_`), DigitalOcean (`dop_v1_`), Databricks (`dapi…`), Sentry (`sntrys_`), Supabase (`sbp_`), HashiCorp Vault (`hvs.`), Terraform Cloud (`….atlasv1.…`), Grafana (`glsa_`), Postman (`PMAK-`), Atlassian (`ATATT3`), Google OAuth (`ya29.`), age (`AGE-SECRET-KEY-1`), Twilio (`SK…`), Telegram and Discord bot tokens, Discord webhooks, Mailgun (`key-`), Doppler (`dp.pt.`), Azure AD (`…8Q~…`), Notion (`secret_`, `ntn_`), Linear (`lin_api_`), Groq (`gsk_`), xAI (`xai-`), Perplexity (`pplx-`), Replicate (`r8_`), Docker (`dckr_pat_`), Netlify (`nfp_`), Square (`sq0atp-`); more Slack prefixes (`xoxe`, `xoxc`, `xoxd`). Each has its own rule id, listed by `/secret-guard rules`. |
 | `jwt` | Three-part tokens whose first two parts are base64url JSON (`eyJ…`). |
 | `bearer-token` | `Bearer <token>` with a digit in it and high entropy. |
 | `url-credentials` | A password inside a URL (`scheme://user:password@host`), except stock ones like `postgres:postgres@localhost`. |
@@ -121,7 +122,7 @@ The mod makes no network calls and writes no secret anywhere: not in messages, t
 
 **Detection is heuristic.** Expect both kinds of mistake.
 
-- **It will miss secrets with no recognizable shape.** A random password in the middle of a sentence; a password shorter than 8 characters, or one that is a plain word; a value in an unlisted vendor format; anything encoded, split across strings or lines, URL-escaped or base64-wrapped; a typed assignment like `password: str = "…"`; secrets inside binary files or text over 4,000,000 characters (only the start is scanned, and it says so).
+- **It will miss secrets with no recognizable shape.** A random password in the middle of a sentence; a password shorter than 8 characters, or one that is a plain word; a value in an unlisted vendor format; anything encoded, split across strings or lines, URL-escaped or base64-wrapped; secrets inside real binary files. Text is scanned to its end, in windows, up to 40,000,000 characters; past that only the start is scanned and, in block mode, the action is refused rather than let through unchecked. The same holds for a command with more than 20 git steps and a `git add` over more than 500 new files.
 - **It will sometimes flag something harmless.** That is what the [allowlist](#allowlist) is for, and what `warn` mode is for while you tune.
 
 **It only guards the four points above.** It does not look at:
@@ -138,7 +139,7 @@ The mod makes no network calls and writes no secret anywhere: not in messages, t
 
 ## Status
 
-v0.1.1. 125 tests run through Claude Code's mod test kit (`claude plugin test .`), `claude plugin validate .` passes, and the code type-checks under `strict` with `noUncheckedIndexedAccess`. It has not been run in a live Claude Code session yet, so treat the first week as a trial and consider starting in `warn` mode.
+v0.1.2. 156 tests run through Claude Code's mod test kit (`claude plugin test .`), `claude plugin validate .` passes, and the code type-checks under `strict` with `noUncheckedIndexedAccess`. File writes, `git add`, prompts and `@` files have been tried in live Claude Code sessions, but it is early, so treat the first week as a trial and consider starting in `warn` mode.
 
 ## Develop
 

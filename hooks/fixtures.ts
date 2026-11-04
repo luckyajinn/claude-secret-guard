@@ -52,4 +52,46 @@ export const fake = {
   privateKeyHeader: (): string => BEGIN + 'RSA PRIVATE ' + 'KEY' + DASHES,
 }
 
+const HEX = '0123456789abcdef'
+const AGE = 'QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L'
+
+/**
+ * One fake token per vendor rule added in 0.1.2, each `{ rule, value }`, assembled
+ * from split prefixes so that no complete key-shaped string sits in the source.
+ */
+export const vendorTokens = (): { rule: string; value: string }[] => [
+  { rule: 'gitlab-token', value: 'gl' + 'pat-' + body(20, 30, B64URL) },
+  { rule: 'pypi-token', value: 'py' + 'pi-' + 'AgEIcHlwaS5' + 'vcmc' + body(60, 31, B64URL) },
+  { rule: 'shopify-token', value: 'shp' + 'at_' + body(32, 32, HEX) },
+  { rule: 'digitalocean-token', value: 'do' + 'p_v1_' + body(64, 33, HEX) },
+  { rule: 'databricks-token', value: 'dap' + 'i' + body(32, 34, 'abcdefgh0123456789') },
+  { rule: 'sentry-token', value: 'sntr' + 'ys_' + body(60, 35, B64URL) },
+  { rule: 'supabase-token', value: 'sb' + 'p_' + body(40, 36, HEX) },
+  { rule: 'vault-token', value: 'hv' + 's.' + body(40, 37, B64URL) },
+  { rule: 'terraform-token', value: body(14, 61) + '.atlas' + 'v1.' + body(66, 62, B64URL) },
+  { rule: 'grafana-token', value: 'gl' + 'sa_' + body(32, 38) + '_' + body(8, 39, HEX) },
+  { rule: 'postman-key', value: 'PM' + 'AK-' + body(24, 40, HEX) + '-' + body(34, 41, HEX) },
+  { rule: 'atlassian-token', value: 'ATAT' + 'T3' + body(70, 42, B64URL) },
+  { rule: 'google-access-token', value: 'ya' + '29.' + body(60, 43, B64URL) },
+  { rule: 'age-secret-key', value: 'AGE-SECRET-' + 'KEY-1' + body(58, 44, AGE) },
+  { rule: 'twilio-key', value: 'S' + 'K' + body(32, 45, HEX) },
+  { rule: 'telegram-bot-token', value: body(9, 46, DIGITS) + ':A' + 'A' + body(33, 47, B64URL) },
+  { rule: 'discord-bot-token', value: 'M' + body(24, 68, B64URL) + '.' + body(6, 69, B64URL) + '.' + body(30, 70, B64URL) },
+  { rule: 'discord-webhook', value: 'https://discord' + '.com/api/webhooks/' + body(18, 48, DIGITS) + '/' + body(68, 49, B64URL) },
+  { rule: 'mailgun-key', value: 'ke' + 'y-' + body(32, 50, HEX) },
+  { rule: 'doppler-token', value: 'dp' + '.pt.' + body(42, 51) },
+  { rule: 'azure-ad-secret', value: body(3, 52) + '8Q' + '~' + body(34, 53, `${ALNUM}_.~-`) },
+  { rule: 'notion-token', value: 'sec' + 'ret_' + body(43, 54) },
+  { rule: 'linear-key', value: 'lin' + '_api_' + body(40, 55) },
+  { rule: 'groq-key', value: 'gs' + 'k_' + body(52, 56) },
+  { rule: 'xai-key', value: 'xa' + 'i-' + body(80, 57) },
+  { rule: 'perplexity-key', value: 'pp' + 'lx-' + body(48, 58) },
+  { rule: 'replicate-token', value: 'r' + '8_' + body(37, 59) },
+  { rule: 'docker-token', value: 'dckr' + '_pat_' + body(27, 60, B64URL) },
+  { rule: 'netlify-token', value: 'nf' + 'p_' + body(36, 63) },
+  { rule: 'square-token', value: 'sq0' + 'atp-' + body(30, 64, B64URL) },
+  { rule: 'slack-token', value: 'xox' + 'c-' + body(12, 65, DIGITS) + '-' + body(24, 66) },
+  { rule: 'slack-token', value: 'xox' + 'e-1-' + body(40, 67) },
+]
+
 export const SALT = 'test-salt-0123456789abcdef0123'

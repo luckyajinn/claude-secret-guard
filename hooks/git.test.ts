@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { addedByFile, parseGitOps, splitCommand, splitNull } from './git'
+import { addedByFile, binaryPaths, parseGitOps, splitCommand, splitNull, unwide } from './git'
 import type { GitOp } from './git'
 
 // The first git command a line holds (the test says what it expects of it).
@@ -86,7 +86,8 @@ test('parseGitOps does not mistake text for a command', () => {
   expect(parseGitOps('echo "git add ."')).toEqual([])
   expect(parseGitOps('git status && git log')).toEqual([])
   expect(parseGitOps('grep -r "git commit" docs')).toEqual([])
-  expect(op('cd sub && git commit -m x').dir).toBeUndefined()
+  // A `cd` is followed, and the folder it left is looked at too (the `cd` may have been in a subshell).
+  expect(parseGitOps('cd sub && git commit -m x').map(o => o.dir)).toEqual(['sub', undefined])
   expect(parseGitOps('')).toEqual([])
 })
 
@@ -146,4 +147,75 @@ test('addedByFile copes with an empty diff, a deletion only and a binary file', 
 test('splitNull splits git -z output', () => {
   expect(splitNull('a.txt\0dir/b c.txt\0')).toEqual(['a.txt', 'dir/b c.txt'])
   expect(splitNull('')).toEqual([])
+})
+
+// ---------------------------------------------------------------------------
+// Ways of writing git that used to hide it
+
+test('a line continuation, a shell keyword and an escaped command word do not hide git', () => {
+  expect(parseGitOps('git \\\n  commit -m x').map(o => o.kind)).toEqual(['commit'])
+  expect(parseGitOps('git `\n  commit -m x').map(o => o.kind)).toEqual(['commit'])
+  expect(parseGitOps('g\\it comm\\it -m x').map(o => o.kind)).toEqual(['commit'])
+  expect(parseGitOps('g`it add .').map(o => o.kind)).toEqual(['add'])
+  expect(parseGitOps('if true; then git commit -a -m x; fi').map(o => o.kind)).toEqual(['commit'])
+  expect(parseGitOps('{ git add .; }').map(o => o.kind)).toEqual(['add'])
+  expect(parseGitOps('! git commit -m x').map(o => o.kind)).toEqual(['commit'])
+  expect(parseGitOps('C:\\Git\\cmd\\git.exe commit -m x').map(o => o.kind)).toEqual(['commit'])
+})
+
+test('a shell run with -c, eval and a prefix command are read inside', () => {
+  expect(parseGitOps('bash -c "git commit -am wip"').map(o => [o.kind, o.isCommitAll])).toEqual([['commit', true]])
+  expect(parseGitOps("sh -lc 'git add -A'").map(o => o.kind)).toEqual(['add'])
+  expect(parseGitOps('powershell -Command "git add ."').map(o => o.kind)).toEqual(['add'])
+  expect(parseGitOps('cmd /c git commit -m x').map(o => o.kind)).toEqual(['commit'])
+  expect(parseGitOps('eval "git commit -a -m x"').map(o => o.kind)).toEqual(['commit'])
+  expect(parseGitOps('sudo -u me git commit -m x').map(o => o.kind)).toEqual(['commit'])
+  expect(parseGitOps('env -i GIT_AUTHOR_NAME=x git add .').map(o => o.kind)).toEqual(['add'])
+  // A shell that runs something else is not git.
+  expect(parseGitOps('bash -c "ls -la"')).toEqual([])
+  expect(parseGitOps('bash script.sh')).toEqual([])
+})
+
+test('a command that is a variable is read the widest way', () => {
+  expect(parseGitOps('$G commit -m x').map(o => [o.kind, o.isCommitAll])).toEqual([['commit', true]])
+  expect(parseGitOps('$G add f.txt').map(o => [o.kind, o.isEverything])).toEqual([['add', true]])
+  expect(parseGitOps('$G status')).toEqual([])
+})
+
+test('cd is followed, and --git-dir, --work-tree and GIT_DIR point somewhere else', () => {
+  expect(parseGitOps('cd app && git add .').map(o => o.dir)).toEqual(['app', undefined])
+  expect(parseGitOps('cd /srv/app && git commit -m x').map(o => o.dir)).toEqual(['/srv/app', undefined])
+  expect(parseGitOps('cd a && cd b && git add .').map(o => o.dir)).toEqual(['a/b', undefined])
+  expect(parseGitOps('Set-Location web; git add .').map(o => o.dir)).toEqual(['web', undefined])
+  // A target the shell has to expand cannot be followed.
+  expect(parseGitOps('cd ~/x && git add .').map(o => o.dir)).toEqual([undefined])
+  expect(parseGitOps('git --git-dir=/r/.git add .').map(o => o.dir)).toEqual(['/r'])
+  expect(parseGitOps('git --work-tree=/w --git-dir=/r/.git commit -m x').map(o => o.dir)).toEqual(['/w'])
+  expect(parseGitOps('GIT_DIR=/r/.git git add .').map(o => o.dir)).toEqual(['/r'])
+})
+
+test('abbreviated long options are read as git reads them', () => {
+  expect(op('git add --upd').isTrackedOnly).toBe(true)
+  expect(op('git add --dry-r').isSkipped).toBe(true)
+  expect(op('git commit --inter -m x').isCommitAll).toBe(true)
+  expect(op('git commit --pathspec-from-file=list.txt').isCommitAll).toBe(true)
+  expect(op('git commit --all -m x').isCommitAll).toBe(true)
+})
+
+test('binaryPaths lists the files a diff calls binary, and not a deleted one', () => {
+  const diff = [
+    'Binary files a/x.txt and b/x.txt differ',
+    'Binary files /dev/null and b/new dir/y.txt differ',
+    'Binary files a/z and /dev/null differ',
+  ].join('\n')
+
+  expect(binaryPaths(diff)).toEqual(['x.txt', 'new dir/y.txt'])
+})
+
+test('unwide reads UTF-16 text that arrives with a NUL after every letter, and leaves a real binary alone', () => {
+  const wide = `${'password = x'.split('').join('\0')}\0`
+
+  expect(unwide(wide)).toBe('password = x')
+  expect(unwide('plain')).toBe('plain')
+  expect(unwide('ab\0cdefghijklmnop')).toBeUndefined()
 })
