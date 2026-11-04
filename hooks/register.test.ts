@@ -393,3 +393,72 @@ test('when the guard itself fails, a file write, a command and a prompt are refu
   expect(prompt.drop).toContain('secret-guard could not check your prompt (an internal error), so it was not sent')
   expect(ran(write)).toBe(false)
 })
+
+// ---------------------------------------------------------------------------
+// Files named with `@`: the engine reads one and hands the model its text as an
+// attachment, which is where the guard judges it.
+
+const attachments = (on: On) => on('prompt.attachment', (_, e) => ({ text: e.text }))
+const attach = ($: Engine, type: string, text: string) => $.prompt.attachment({ type, text, origin: { kind: 'engine' } } as never)
+
+test('an @-mentioned html file with a key in it reaches the model as a notice, without the value', async ($, on) => {
+  engine(on)
+  attachments(on)
+
+  const key = fake.googleKey()
+  const page = `<html><script>\n  const cfg = { apiKey: "${key}" }\n</script></html>`
+  const result = await attach($, 'file', page)
+  const text = result.text ?? ''
+
+  expect(text).toContain('secret-guard blocked this attached file: 1 possible secret found')
+  expect(text).toContain('Google API key [google-api-key] at attached file, about line 2')
+  expect(text).toContain('None of the file was sent to the model.')
+  expect(text).not.toContain(key)
+  expect(text).not.toContain('<script>')
+
+  const recent = (await slash($, 'recent')).text ?? ''
+
+  expect(recent).toContain('google-api-key at attached file')
+  expect(recent).not.toContain(key)
+})
+
+test('a clean @-mentioned file, and attachments that are not files, go through unchanged', async ($, on) => {
+  engine(on)
+  attachments(on)
+
+  expect((await attach($, 'file', '<html><p>hello</p></html>')).text).toBe('<html><p>hello</p></html>')
+
+  // Only a file's text is judged; the engine's own reminders are left alone.
+  const reminder = `reminder: ${fake.googleKey()}`
+
+  expect((await attach($, 'todo_reminder', reminder)).text).toBe(reminder)
+})
+
+test('a file that changed since the model read it is judged too', async ($, on) => {
+  engine(on)
+  attachments(on)
+
+  const result = await attach($, 'edited_text_file', `TOKEN=${fake.githubToken()}`)
+
+  expect(result.text).toContain('secret-guard blocked this attached file')
+})
+
+test('in warn mode an attached file with a secret goes through, loudly', { options: { mode: 'warn' } }, async ($, on) => {
+  const { logs } = engine(on)
+
+  attachments(on)
+
+  const text = `key ${fake.awsKeyId()}`
+
+  expect((await attach($, 'file', text)).text).toBe(text)
+  expect(logs.join('\n')).toContain('secret-guard WARNING: 1 possible secret in this attached file')
+})
+
+test('with prompt guarding off an attached file is not scanned', { options: { guardPrompts: false } }, async ($, on) => {
+  engine(on)
+  attachments(on)
+
+  const text = `key ${fake.awsKeyId()}`
+
+  expect((await attach($, 'file', text)).text).toBe(text)
+})

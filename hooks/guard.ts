@@ -78,6 +78,20 @@ export const checkPromptText = (text: string, ctx: ScanContext): Checked => {
   }
 }
 
+/**
+ * A file the person named with `@` (or one the model already read and that
+ * changed): the text the engine is about to hand the model for it. The text has
+ * the engine's framing and line numbers, so a line here is approximate.
+ */
+export const checkAttachedFile = (text: string, ctx: ScanContext): Checked => {
+  const { findings, isTruncated } = scan(text, ctx)
+
+  return {
+    hits: findings.map(f => toHit(f, `attached file, about line ${f.line}`)),
+    notes: isTruncated ? [TRUNCATED] : [],
+  }
+}
+
 // Prompts that are raised by something other than the person: a task finishing,
 // a schedule, another session, a channel's sender, a coordinator, an observer.
 const MACHINE_ORIGINS = new Set([

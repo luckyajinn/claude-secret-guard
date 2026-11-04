@@ -25,6 +25,7 @@ Every guard point has a real veto in the mod API, so each one blocks rather than
 | Shell commands | `tool.call` on `Bash`, `PowerShell` | The text of the command. | **Blocked.** The command does not run. |
 | `git add` and `git commit` | the same `tool.call` | The changes the command would stage or commit, read with `git diff` and `git ls-files` (see below). | **Blocked.** Nothing is staged or committed. |
 | Your prompts | `prompt.submit` | What you type, before it is sent to the model. | **Blocked.** The prompt is dropped and you are told why. |
+| Files you name with `@` | `prompt.attachment` | The text of the file, as the engine is about to hand it to the model. | **Withheld.** The model gets a notice (rule, place, id) instead of the file. |
 
 **Where it only warns.** Two cases degrade from a block to a loud warning (a toast plus a line that stays in the transcript), and say so:
 
@@ -110,7 +111,7 @@ Each is a row in the plugin's config.
 | `guardFiles` | on | Write, Edit, NotebookEdit. |
 | `guardCommands` | on | Bash and PowerShell command text. |
 | `guardCommits` | on | The git add / git commit scan. |
-| `guardPrompts` | on | Your prompts. |
+| `guardPrompts` | on | Your prompts, and files you name with `@`. |
 
 ## Privacy
 
@@ -125,7 +126,8 @@ The mod makes no network calls and writes no secret anywhere: not in messages, t
 
 **It only guards the four points above.** It does not look at:
 
-- **What the model reads.** `Read`, `Grep`, `cat .env`, MCP results, web pages and command output are not scanned or redacted. If a secret is in your project, this mod does not stop the model from seeing it.
+- **What the model reads.** Apart from a file you name with `@`, which is scanned, `Read`, `Grep`, `cat .env`, MCP results, web pages and command output are not scanned or redacted. If a secret is in your project, this mod does not stop the model from seeing it.
+- **Pasted or dropped images and PDFs.** A file you name with `@` is scanned, and a withheld one is replaced by a notice before the model sees it. An image or a PDF attached to a prompt is not read for secrets. The engine's own transcript record of an `@` file is not changed by the guard.
 - **Other tools' arguments.** `Agent` prompts, MCP tool calls, `WebFetch` URLs and the like are not scanned.
 - **Files written by a command.** `echo "$KEY" > file`, a script that generates a config, a `curl -o`: the text of the command is scanned, what it writes is not. That includes a file a command creates and then `git add`s in the same line (`echo … > f && git add f`): the git scan runs before the command does, so the file is not there to see yet. Run the `git add` or `git commit` as its own command and it is scanned.
 - **`git push`**, commits made outside Claude Code, commits made by a script, a commit in a folder other than the session's after `cd` (use `git -C`, which it follows), and secrets already in history.
