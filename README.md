@@ -136,7 +136,7 @@ The mod makes no network calls and writes no secret anywhere: not in messages, t
 
 ## Status
 
-v0.1.0. 125 tests run through Claude Code's mod test kit (`claude plugin test .`), `claude plugin validate .` passes, and the code type-checks under `strict` with `noUncheckedIndexedAccess`. It has not been run in a live Claude Code session yet, so treat the first week as a trial and consider starting in `warn` mode.
+v0.1.1. 125 tests run through Claude Code's mod test kit (`claude plugin test .`), `claude plugin validate .` passes, and the code type-checks under `strict` with `noUncheckedIndexedAccess`. It has not been run in a live Claude Code session yet, so treat the first week as a trial and consider starting in `warn` mode.
 
 ## Develop
 

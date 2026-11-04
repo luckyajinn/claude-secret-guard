@@ -318,7 +318,9 @@ test('a prompt that holds a secret is dropped, and the secret is not echoed', as
   const why = result.drop ?? ''
 
   expect(result.text).toBeUndefined()
-  expect(why).toContain('secret-guard stopped this prompt before it was sent: 1 possible secret found')
+  expect(why).toContain('secret-guard found 1 possible secret in your prompt, so nothing was sent')
+  // One line: the app's banner shows a line break as a replacement character.
+  expect(why.includes('\n') || why.includes('\r') || why.includes(' ')).toBe(false)
   expect(why).toContain('GitHub token [github-token] at prompt line 2, column 1')
   expect(why).toContain('/secret-guard allow fp:')
   expect(why).not.toContain(token)

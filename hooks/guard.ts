@@ -283,14 +283,26 @@ export const denyMessage = (subject: string, outcome: string, hits: readonly Hit
     allowHint(hits),
   ].join('\n')
 
-/** The text shown to the person when their prompt is stopped. */
-export const promptMessage = (hits: readonly Hit[]): string =>
-  [
-    `secret-guard stopped this prompt before it was sent: ${plural(hits.length, 'possible secret')} found. The values are hidden on purpose.`,
-    ...list(hits),
-    'Edit the prompt to leave the value out (describe it, or use a placeholder) and send it again.',
+/**
+ * The text shown to the person when their prompt is dropped. One line on
+ * purpose: the app shows it in a banner after "Prompt dropped by a hook:", and
+ * that banner turns a line break into a "�". So it opens with what was found,
+ * not with "stopped this prompt" (the banner already says that).
+ */
+export const promptMessage = (hits: readonly Hit[]): string => {
+  const found = hits.slice(0, MAX_LISTED).map(hit => `${hit.label} [${hit.rule}] at ${hit.location} (id ${hit.fingerprint})`)
+
+  if (hits.length > MAX_LISTED) {
+    found.push(`and ${hits.length - MAX_LISTED} more`)
+  }
+
+  return [
+    `secret-guard found ${plural(hits.length, 'possible secret')} in your prompt, so nothing was sent. The values are hidden on purpose.`,
+    `Found: ${found.join('; ')}.`,
+    'Remove the value (describe it, or use a placeholder) and send again.',
     `${hits.length === 1 ? 'If it is a harmless placeholder' : 'If they are harmless placeholders'}, run /secret-guard allow fp:${hits[0]?.fingerprint ?? ''} first.`,
-  ].join('\n')
+  ].join(' ')
+}
 
 /** What warn mode, or a guard that could not scan, shows loudly instead of blocking. */
 export const warnMessage = (subject: string, hits: readonly Hit[], notes: readonly string[]): string =>
